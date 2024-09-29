@@ -22,8 +22,9 @@ SAMPLE_RATE = 44100  # Samples per second
 DURATION = 0.5       # Duration of each tone in seconds
 MAX_FLOW_DURATION = 300  # 5 minutes in seconds
 
-# Initialize pygame mixer with mono sound
+# Initialize pygame mixer with mono sound and multiple channels
 pygame.mixer.init(frequency=SAMPLE_RATE, channels=1)
+pygame.mixer.set_num_channels(32)  # Increase number of channels to handle multiple sounds
 
 # Create a queue for audio playback
 audio_queue = queue.Queue(maxsize=100)
