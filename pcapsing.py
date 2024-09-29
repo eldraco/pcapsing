@@ -13,6 +13,7 @@ ANSI_COLORS = {
     'green': '\033[32m',
     'magenta': '\033[35m',
     'cyan': '\033[36m',
+    'yellow': '\033[33m',
     'reset': '\033[0m'
 }
 
@@ -257,10 +258,14 @@ def generate_and_log_sound(flow):
         else:
             protocol_color = 'reset'
 
+        # Get current timestamp
+        timestamp = time.strftime("[%m/%d/%y %H:%M:%S]")
+
         # Format log message with ANSI colors
         flow_str = ansi_color(str(flow), protocol_color)
-        sound_str = f"Sound: {ansi_color(f'{freq:.1f}Hz', 'cyan')}, Vol:{ansi_color(f'{vol:.2f}', 'cyan')}"
-        log_message = f"{flow_str} | {sound_str}"
+        freq_str = ansi_color(f"{freq:.1f}Hz", 'cyan')
+        vol_str = ansi_color(f"{vol:.2f}", 'cyan')
+        log_message = f"{timestamp} {flow_str} | Sound: {freq_str}, Vol:{vol_str}"
         logger.info(log_message)
 
 def packet_handler(packet):
@@ -326,10 +331,13 @@ def main():
     filter_str = ' and '.join(filters) if filters else None
 
     # Display startup information with colors
-    console_message = f"Starting Network Flow Audio Sniffer...\nFilter applied: {ansi_color(filter_str if filter_str else 'None', 'cyan')}"
+    timestamp = time.strftime("[%m/%d/%y %H:%M:%S]")
+    filter_display = ansi_color(filter_str if filter_str else 'None', 'cyan')
+    interface_display = ansi_color(args.interface, 'magenta') if args.interface else 'None'
+    startup_message = f"{timestamp} Starting Network Flow Audio Sniffer...\n{timestamp} Filter applied: {filter_display}"
     if args.interface:
-        console_message += f"\nSniffing on interface: {ansi_color(args.interface, 'magenta')}"
-    logger.info(console_message)
+        startup_message += f"\n{timestamp} Sniffing on interface: {interface_display}"
+    logger.info(startup_message)
 
     # Start threads
     playback_thread = threading.Thread(target=audio_playback_thread, daemon=True)
@@ -341,7 +349,7 @@ def main():
     try:
         sniff(filter=filter_str, prn=packet_handler, iface=args.interface)
     except KeyboardInterrupt:
-        logger.info(f"{ansi_color('Stopping packet sniffing.', 'yellow')}")
+        logger.info(f"{ansi_color('[Stopping packet sniffing.]', 'yellow')}")
     finally:
         audio_queue.put(None)
         playback_thread.join()
