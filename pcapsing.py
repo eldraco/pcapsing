@@ -6,8 +6,15 @@ import numpy as np
 import pygame
 from scapy.all import sniff, IP, TCP, UDP, ICMP
 import logging
-from rich.logging import RichHandler
-from rich.console import Console
+
+# Define ANSI color codes
+ANSI_COLORS = {
+    'blue': '\033[34m',
+    'green': '\033[32m',
+    'magenta': '\033[35m',
+    'cyan': '\033[36m',
+    'reset': '\033[0m'
+}
 
 # Audio settings
 SAMPLE_RATE = 44100  # Samples per second
@@ -24,28 +31,25 @@ audio_queue = queue.Queue(maxsize=100)
 flows = {}
 FLOW_TIMEOUT = 60  # Seconds
 
-# Setup rich console
-console = Console()
-
-# Setup logging with RichHandler for console and FileHandler for file
+# Setup logging
 logger = logging.getLogger("pcapsing")
 logger.setLevel(logging.INFO)
 
-# Console handler with Rich
-console_handler = RichHandler(rich_tracebacks=True)
+# Console handler
+console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter("%(message)s")
-console_handler.setFormatter(formatter)
+console_formatter = logging.Formatter("%(message)s")
+console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
 
-# File handler without 'INFO'
+# File handler
 file_handler = logging.FileHandler("flows.log")
 file_handler.setLevel(logging.INFO)
-file_formatter = logging.Formatter("%(asctime)s - %(message)s")
+file_formatter = logging.Formatter("%(message)s")
 file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
 
-# Define note frequencies for C major scale in different octaves
+# Define note frequencies for C major scale
 NOTE_FREQUENCIES = {
     'C': 261.63,  # C4
     'D': 293.66,
@@ -67,21 +71,24 @@ PROTOCOL_SOUND_CONFIG = {
             'ESTABLISHED': 'F',
             'FIN_WAIT': 'G',
             'RESET': 'A'
-        }
+        },
+        'color': 'blue'
     },
     'UDP': {
         'base_octave': 4,  # C4 to B4
         'states': {
             'INIT': 'C',
             'ESTABLISHED': 'D'
-        }
+        },
+        'color': 'green'
     },
     'ICMP': {
         'base_octave': 5,  # C5 to B5
         'states': {
             'INIT': 'C',
             'ESTABLISHED': 'D'
-        }
+        },
+        'color': 'magenta'
     }
 }
 
@@ -139,9 +146,18 @@ class Flow:
                 f"Bytes: {self.bytes_src_to_dst}/{self.bytes_dst_to_src} | "
                 f"Duration: {duration}s | State: {self.state}")
 
+def ansi_color(text, color):
+    """
+    Wrap text with ANSI color codes.
+    """
+    color_code = ANSI_COLORS.get(color, ANSI_COLORS['reset'])
+    reset_code = ANSI_COLORS['reset']
+    return f"{color_code}{text}{reset_code}"
+
 def generate_tone(protocol, state, volume=0.5):
     """
     Generate a sine wave tone based on protocol and state.
+    Returns the sound object, frequency, and volume.
     """
     config = PROTOCOL_SOUND_CONFIG.get(protocol)
     if not config:
@@ -165,6 +181,9 @@ def generate_tone(protocol, state, volume=0.5):
     return sound, frequency, volume
 
 def audio_playback_thread():
+    """
+    Thread function to play sounds from the audio queue.
+    """
     while True:
         item = audio_queue.get()
         if item is None:
@@ -172,12 +191,15 @@ def audio_playback_thread():
         sound, frequency, volume = item
         try:
             sound.play()
-            logger.info(f"{frequency:.1f}Hz, Vol:{volume:.2f}")
         except Exception as e:
-            logger.error(f"[red]Audio playback error:[/red] {e}")
+            # Log audio playback errors in red
+            logger.error(f"{ansi_color('Audio playback error:', 'red')} {e}")
         audio_queue.task_done()
 
 def flow_monitor_thread():
+    """
+    Thread function to monitor and process flows.
+    """
     while True:
         time.sleep(1)
         current_time = time.time()
@@ -209,21 +231,42 @@ def flow_monitor_thread():
             flow.bytes_dst_to_src = 0
 
 def generate_and_log_sound(flow):
-    frequency, volume = 440.0, 0.5  # Default values
-    sound_data = generate_tone(flow.protocol, flow.state, volume=min(1.0, (flow.bytes_src_to_dst + flow.bytes_dst_to_src) / 2000))
+    """
+    Generate sound based on the flow and log the details.
+    """
+    sound_data = generate_tone(
+        flow.protocol,
+        flow.state,
+        volume=min(1.0, (flow.bytes_src_to_dst + flow.bytes_dst_to_src) / 2000)
+    )
     if sound_data:
         sound, freq, vol = sound_data
         try:
             audio_queue.put_nowait((sound, freq, vol))
         except queue.Full:
-            logger.warning(f"Audio queue full. Dropping sound for flow: {flow}")
+            logger.warning(f"{ansi_color('Audio queue full. Dropping sound for flow:', 'yellow')} {flow}")
             return
 
-        # Log the flow details and sound attributes in a concise format
-        log_message = f"{flow} | Sound: {freq:.1f}Hz, Vol:{vol:.2f}"
+        # Determine color based on protocol
+        if flow.protocol == 'TCP':
+            protocol_color = 'blue'
+        elif flow.protocol == 'UDP':
+            protocol_color = 'green'
+        elif flow.protocol == 'ICMP':
+            protocol_color = 'magenta'
+        else:
+            protocol_color = 'reset'
+
+        # Format log message with ANSI colors
+        flow_str = ansi_color(str(flow), protocol_color)
+        sound_str = f"Sound: {ansi_color(f'{freq:.1f}Hz', 'cyan')}, Vol:{ansi_color(f'{vol:.2f}', 'cyan')}"
+        log_message = f"{flow_str} | {sound_str}"
         logger.info(log_message)
 
 def packet_handler(packet):
+    """
+    Handle incoming packets and update flows.
+    """
     if IP in packet:
         src_ip = packet[IP].src
         dst_ip = packet[IP].dst
@@ -282,10 +325,11 @@ def main():
         filters.append('not multicast and not broadcast')
     filter_str = ' and '.join(filters) if filters else None
 
-    console.print("Starting Network Flow Audio Sniffer...")
-    console.print(f"Filter applied: [bold cyan]{filter_str if filter_str else 'None'}[/bold cyan]")
+    # Display startup information with colors
+    console_message = f"Starting Network Flow Audio Sniffer...\nFilter applied: {ansi_color(filter_str if filter_str else 'None', 'cyan')}"
     if args.interface:
-        console.print(f"Sniffing on interface: [bold magenta]{args.interface}[/bold magenta]")
+        console_message += f"\nSniffing on interface: {ansi_color(args.interface, 'magenta')}"
+    logger.info(console_message)
 
     # Start threads
     playback_thread = threading.Thread(target=audio_playback_thread, daemon=True)
@@ -297,20 +341,12 @@ def main():
     try:
         sniff(filter=filter_str, prn=packet_handler, iface=args.interface)
     except KeyboardInterrupt:
-        console.print("\nStopping packet sniffing.")
+        logger.info(f"{ansi_color('Stopping packet sniffing.', 'yellow')}")
     finally:
         audio_queue.put(None)
         playback_thread.join()
         pygame.mixer.quit()
 
 if __name__ == "__main__":
-    # Ensure rich is available
-    try:
-        from rich.console import Console
-    except ImportError:
-        print("Please install the 'rich' library to enable enhanced logging:")
-        print("pip install rich")
-        exit(1)
-    
     main()
 
