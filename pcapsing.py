@@ -6,6 +6,8 @@ import numpy as np
 import pygame
 from scapy.all import sniff, IP, TCP, UDP
 import logging
+from rich.logging import RichHandler
+from rich.console import Console
 
 # Audio settings
 SAMPLE_RATE = 44100  # Samples per second
@@ -22,12 +24,26 @@ audio_queue = queue.Queue(maxsize=100)
 flows = {}
 FLOW_TIMEOUT = 60  # Seconds
 
-# Setup logging
-logging.basicConfig(
-    filename='flows.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Setup rich console
+console = Console()
+
+# Setup logging with RichHandler for console and FileHandler for file
+logger = logging.getLogger("pcapsing")
+logger.setLevel(logging.INFO)
+
+# Console handler with Rich
+console_handler = RichHandler(rich_tracebacks=True)
+console_handler.setLevel(logging.INFO)
+formatter = logging.Formatter("%(message)s")
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# File handler without 'INFO'
+file_handler = logging.FileHandler("flows.log")
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter("%(asctime)s - %(message)s")
+file_handler.setFormatter(file_formatter)
+logger.addHandler(file_handler)
 
 class Flow:
     def __init__(self, src_ip, src_port, dst_ip, dst_port, protocol):
@@ -41,7 +57,7 @@ class Flow:
         self.start_time = time.time()
         self.last_seen = self.start_time
         self.state = 'INIT'
-    
+
     def update(self, packet):
         self.last_seen = time.time()
         pkt_len = len(packet)
@@ -73,14 +89,12 @@ class Flow:
                 self.state = 'FIN_WAIT'
             elif flags & 0x04:  # RST
                 self.state = 'RESET'
-    
+
     def __str__(self):
         duration = self.last_seen - self.start_time
-        return (f"Flow(src_ip={self.src_ip}, src_port={self.src_port}, "
-                f"dst_ip={self.dst_ip}, dst_port={self.dst_port}, "
-                f"protocol={self.protocol}, bytes_src_to_dst={self.bytes_src_to_dst}, "
-                f"bytes_dst_to_src={self.bytes_dst_to_src}, duration={duration:.2f}s, "
-                f"state={self.state})")
+        return (f"{self.protocol} Flow {self.src_ip}:{self.src_port} -> {self.dst_ip}:{self.dst_port} | "
+                f"Bytes: {self.bytes_src_to_dst}/{self.bytes_dst_to_src} | "
+                f"Duration: {int(duration)}s | State: {self.state}")
 
 def generate_tone(frequency, duration, volume=0.5):
     sample_count = int(SAMPLE_RATE * duration)
@@ -99,7 +113,7 @@ def audio_playback_thread():
         try:
             sound.play()
         except Exception as e:
-            logging.error(f"Audio playback error: {e}")
+            logger.error(f"[red]Audio playback error:[/red] {e}")
         audio_queue.task_done()
 
 def flow_monitor_thread():
@@ -143,11 +157,12 @@ def generate_and_log_sound(flow):
     try:
         audio_queue.put_nowait(sound)
     except queue.Full:
-        logging.warning(f"Audio queue full. Dropping sound for flow: {flow_id}")
-        pass
+        logger.warning(f"Audio queue full. Dropping sound for flow: {flow}")
+        return
 
-    # Log the flow details and sound attributes
-    logging.info(f"Processed {flow} | Sound -> Frequency: {frequency:.2f} Hz, Volume: {volume:.2f}, Duration: {DURATION}s")
+    # Log the flow details and sound attributes in a concise format
+    log_message = (f"{flow} | Sound: {frequency:.1f}Hz, Vol:{volume:.2f}")
+    logger.info(log_message)
 
 def packet_handler(packet):
     if IP in packet:
@@ -180,7 +195,7 @@ def packet_handler(packet):
                 flows[flow_id] = Flow(src_ip, src_port, dst_ip, dst_port, proto)
 
 def main():
-    parser = argparse.ArgumentParser(description="Network Flow Audio Sniffer with Logging and Flow Splitting")
+    parser = argparse.ArgumentParser(description="Network Flow Audio Sniffer with Enhanced Logging")
     parser.add_argument('--tcp', action='store_true', help='Include only TCP flows')
     parser.add_argument('--udp', action='store_true', help='Include only UDP flows')
     parser.add_argument('--include-multicast', action='store_true', help='Include multicast and broadcast flows')
@@ -196,10 +211,10 @@ def main():
         filters.append('not multicast and not broadcast')
     filter_str = ' and '.join(filters) if filters else None
 
-    print("Starting Network Flow Audio Sniffer...")
-    print(f"Filter applied: {filter_str if filter_str else 'None'}")
+    console.print("Starting Network Flow Audio Sniffer...")
+    console.print(f"Filter applied: [bold cyan]{filter_str if filter_str else 'None'}[/bold cyan]")
     if args.interface:
-        print(f"Sniffing on interface: {args.interface}")
+        console.print(f"Sniffing on interface: [bold magenta]{args.interface}[/bold magenta]")
 
     # Start threads
     playback_thread = threading.Thread(target=audio_playback_thread, daemon=True)
@@ -211,12 +226,20 @@ def main():
     try:
         sniff(filter=filter_str, prn=packet_handler, iface=args.interface)
     except KeyboardInterrupt:
-        print("\nStopping packet sniffing.")
+        console.print("\nStopping packet sniffing.")
     finally:
         audio_queue.put(None)
         playback_thread.join()
         pygame.mixer.quit()
 
 if __name__ == "__main__":
+    # Ensure rich is available
+    try:
+        from rich.console import Console
+    except ImportError:
+        print("Please install the 'rich' library to enable enhanced logging:")
+        print("pip install rich")
+        exit(1)
+    
     main()
 
