@@ -19,15 +19,15 @@ ANSI_COLORS = {
 
 # Audio settings
 SAMPLE_RATE = 44100  # Samples per second
-DURATION = 0.5       # Duration of each tone in seconds
+DURATION = 0.2        # Duration of each tone in seconds (reduced from 0.5)
 MAX_FLOW_DURATION = 300  # 5 minutes in seconds
 
 # Initialize pygame mixer with mono sound and multiple channels
 pygame.mixer.init(frequency=SAMPLE_RATE, channels=1)
 pygame.mixer.set_num_channels(32)  # Increase number of channels to handle multiple sounds
 
-# Create a queue for audio playback
-audio_queue = queue.Queue(maxsize=100)
+# Create a queue for audio playback with increased maxsize
+audio_queue = queue.Queue(maxsize=1000)  # Increased from 100 to 1000
 
 # Flow tracking
 flows = {}
