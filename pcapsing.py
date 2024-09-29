@@ -203,7 +203,7 @@ def flow_monitor_thread():
     Thread function to monitor and process flows.
     """
     while True:
-        time.sleep(1)
+        time.sleep(0.1)  # Reduced sleep time to process flows more frequently
         current_time = time.time()
         expired_flows = []
         long_flows = []
@@ -236,10 +236,14 @@ def generate_and_log_sound(flow):
     """
     Generate sound based on the flow and log the details.
     """
+    # Calculate volume with a minimum threshold to avoid volume 0
+    calculated_volume = min(1.0, (flow.bytes_src_to_dst + flow.bytes_dst_to_src) / 2000)
+    volume = max(calculated_volume, 0.05)  # Set a minimum volume of 0.05
+
     sound_data = generate_tone(
         flow.protocol,
         flow.state,
-        volume=min(1.0, (flow.bytes_src_to_dst + flow.bytes_dst_to_src) / 2000)
+        volume=volume
     )
     if sound_data:
         sound, freq, vol = sound_data
