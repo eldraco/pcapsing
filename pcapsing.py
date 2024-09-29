@@ -4,7 +4,7 @@ import queue
 import time
 import numpy as np
 import pygame
-from scapy.all import sniff, IP, TCP, UDP
+from scapy.all import sniff, IP, TCP, UDP, ICMP
 import logging
 from rich.logging import RichHandler
 from rich.console import Console
@@ -45,6 +45,46 @@ file_formatter = logging.Formatter("%(asctime)s - %(message)s")
 file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
 
+# Define note frequencies for C major scale in different octaves
+NOTE_FREQUENCIES = {
+    'C': 261.63,  # C4
+    'D': 293.66,
+    'E': 329.63,
+    'F': 349.23,
+    'G': 392.00,
+    'A': 440.00,
+    'B': 493.88
+}
+
+# Protocol sound configurations
+PROTOCOL_SOUND_CONFIG = {
+    'TCP': {
+        'base_octave': 3,  # C3 to B3
+        'states': {
+            'INIT': 'C',
+            'SYN_SENT': 'D',
+            'SYN_RECEIVED': 'E',
+            'ESTABLISHED': 'F',
+            'FIN_WAIT': 'G',
+            'RESET': 'A'
+        }
+    },
+    'UDP': {
+        'base_octave': 4,  # C4 to B4
+        'states': {
+            'INIT': 'C',
+            'ESTABLISHED': 'D'
+        }
+    },
+    'ICMP': {
+        'base_octave': 5,  # C5 to B5
+        'states': {
+            'INIT': 'C',
+            'ESTABLISHED': 'D'
+        }
+    }
+}
+
 class Flow:
     def __init__(self, src_ip, src_port, dst_ip, dst_port, protocol):
         self.src_ip = src_ip
@@ -67,11 +107,14 @@ class Flow:
             pkt_layer = packet[TCP]
         elif self.protocol == 'UDP' and UDP in packet:
             pkt_layer = packet[UDP]
+        elif self.protocol == 'ICMP' and ICMP in packet:
+            pkt_layer = packet[ICMP]
         else:
             # If the expected layer isn't present, skip updating
             return
         
-        if packet[IP].src == self.src_ip and pkt_layer.sport == self.src_port:
+        # Update byte counts
+        if packet[IP].src == self.src_ip and getattr(pkt_layer, 'sport', None) == self.src_port:
             self.bytes_src_to_dst += pkt_len
         else:
             self.bytes_dst_to_src += pkt_len
@@ -91,27 +134,45 @@ class Flow:
                 self.state = 'RESET'
 
     def __str__(self):
-        duration = self.last_seen - self.start_time
+        duration = int(self.last_seen - self.start_time)
         return (f"{self.protocol} Flow {self.src_ip}:{self.src_port} -> {self.dst_ip}:{self.dst_port} | "
                 f"Bytes: {self.bytes_src_to_dst}/{self.bytes_dst_to_src} | "
-                f"Duration: {int(duration)}s | State: {self.state}")
+                f"Duration: {duration}s | State: {self.state}")
 
-def generate_tone(frequency, duration, volume=0.5):
-    sample_count = int(SAMPLE_RATE * duration)
-    t = np.linspace(0, duration, sample_count, False)
+def generate_tone(protocol, state, volume=0.5):
+    """
+    Generate a sine wave tone based on protocol and state.
+    """
+    config = PROTOCOL_SOUND_CONFIG.get(protocol)
+    if not config:
+        return None  # Unsupported protocol
+
+    note = config['states'].get(state)
+    if not note:
+        return None  # Unsupported state
+
+    # Calculate frequency based on octave and note
+    base_freq = NOTE_FREQUENCIES[note]
+    octave = config['base_octave']
+    frequency = base_freq * (2 ** (octave - 4))  # Adjust octave
+
+    # Generate waveform
+    sample_count = int(SAMPLE_RATE * DURATION)
+    t = np.linspace(0, DURATION, sample_count, False)
     waveform = np.sin(2 * np.pi * frequency * t)
     waveform = (waveform * volume * 32767).astype(np.int16)
     sound = pygame.sndarray.make_sound(waveform)
-    return sound
+    return sound, frequency, volume
 
 def audio_playback_thread():
     while True:
         item = audio_queue.get()
         if item is None:
             break
-        sound = item
+        sound, frequency, volume = item
         try:
             sound.play()
+            logger.info(f"{frequency:.1f}Hz, Vol:{volume:.2f}")
         except Exception as e:
             logger.error(f"[red]Audio playback error:[/red] {e}")
         audio_queue.task_done()
@@ -148,21 +209,19 @@ def flow_monitor_thread():
             flow.bytes_dst_to_src = 0
 
 def generate_and_log_sound(flow):
-    duration = flow.last_seen - flow.start_time
-    frequency = 440.0 + (flow.bytes_src_to_dst % 500)
-    volume = min(1.0, (flow.bytes_src_to_dst + flow.bytes_dst_to_src) / 2000)
-    state = flow.state
+    frequency, volume = 440.0, 0.5  # Default values
+    sound_data = generate_tone(flow.protocol, flow.state, volume=min(1.0, (flow.bytes_src_to_dst + flow.bytes_dst_to_src) / 2000))
+    if sound_data:
+        sound, freq, vol = sound_data
+        try:
+            audio_queue.put_nowait((sound, freq, vol))
+        except queue.Full:
+            logger.warning(f"Audio queue full. Dropping sound for flow: {flow}")
+            return
 
-    sound = generate_tone(frequency, DURATION, volume)
-    try:
-        audio_queue.put_nowait(sound)
-    except queue.Full:
-        logger.warning(f"Audio queue full. Dropping sound for flow: {flow}")
-        return
-
-    # Log the flow details and sound attributes in a concise format
-    log_message = (f"{flow} | Sound: {frequency:.1f}Hz, Vol:{volume:.2f}")
-    logger.info(log_message)
+        # Log the flow details and sound attributes in a concise format
+        log_message = f"{flow} | Sound: {freq:.1f}Hz, Vol:{vol:.2f}"
+        logger.info(log_message)
 
 def packet_handler(packet):
     if IP in packet:
@@ -178,14 +237,23 @@ def packet_handler(packet):
             proto = 'UDP'
             src_port = packet[UDP].sport
             dst_port = packet[UDP].dport
+        elif protocol_num == 1 and ICMP in packet:
+            proto = 'ICMP'
+            src_port = 0
+            dst_port = 0
         else:
             proto = 'OTHER'
             src_port = 0
             dst_port = 0
 
-        if proto in ['TCP', 'UDP']:
-            flow_id = (src_ip, src_port, dst_ip, dst_port, proto)
-            reverse_flow_id = (dst_ip, dst_port, src_ip, src_port, proto)
+        if proto in ['TCP', 'UDP', 'ICMP']:
+            if proto == 'ICMP':
+                # For ICMP, ports are not applicable
+                flow_id = (src_ip, 0, dst_ip, 0, proto)
+                reverse_flow_id = (dst_ip, 0, src_ip, 0, proto)
+            else:
+                flow_id = (src_ip, src_port, dst_ip, dst_port, proto)
+                reverse_flow_id = (dst_ip, dst_port, src_ip, src_port, proto)
 
             if flow_id in flows:
                 flows[flow_id].update(packet)
@@ -195,9 +263,10 @@ def packet_handler(packet):
                 flows[flow_id] = Flow(src_ip, src_port, dst_ip, dst_port, proto)
 
 def main():
-    parser = argparse.ArgumentParser(description="Network Flow Audio Sniffer with Enhanced Logging")
+    parser = argparse.ArgumentParser(description="Network Flow Audio Sniffer with Enhanced Logging and Sound Features")
     parser.add_argument('--tcp', action='store_true', help='Include only TCP flows')
     parser.add_argument('--udp', action='store_true', help='Include only UDP flows')
+    parser.add_argument('--icmp', action='store_true', help='Include only ICMP flows')
     parser.add_argument('--include-multicast', action='store_true', help='Include multicast and broadcast flows')
     parser.add_argument('--interface', '-i', type=str, help='Network interface to sniff on')
     args = parser.parse_args()
@@ -207,6 +276,8 @@ def main():
         filters.append('tcp')
     if args.udp:
         filters.append('udp')
+    if args.icmp:
+        filters.append('icmp')
     if not args.include_multicast:
         filters.append('not multicast and not broadcast')
     filter_str = ' and '.join(filters) if filters else None
