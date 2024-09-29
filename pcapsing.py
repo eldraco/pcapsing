@@ -16,9 +16,44 @@ pygame.mixer.init(frequency=SAMPLE_RATE, channels=1)
 # Create a queue for audio playback
 audio_queue = queue.Queue(maxsize=100)
 
-# Dictionary to track flows
+# Flow tracking
 flows = {}
 FLOW_TIMEOUT = 60  # Seconds
+
+class Flow:
+    def __init__(self, src_ip, src_port, dst_ip, dst_port, protocol):
+        self.src_ip = src_ip
+        self.src_port = src_port
+        self.dst_ip = dst_ip
+        self.dst_port = dst_port
+        self.protocol = protocol
+        self.bytes_src_to_dst = 0
+        self.bytes_dst_to_src = 0
+        self.start_time = time.time()
+        self.last_seen = self.start_time
+        self.state = 'INIT'
+
+    def update(self, packet):
+        self.last_seen = time.time()
+        pkt_len = len(packet)
+        if packet[IP].src == self.src_ip and packet.sport == self.src_port:
+            self.bytes_src_to_dst += pkt_len
+        else:
+            self.bytes_dst_to_src += pkt_len
+
+        if self.protocol == 'TCP':
+            tcp_layer = packet[TCP]
+            flags = tcp_layer.flags
+            if flags & 0x02:  # SYN
+                self.state = 'SYN_SENT'
+            elif flags & 0x12:  # SYN-ACK
+                self.state = 'SYN_RECEIVED'
+            elif flags & 0x10:  # ACK
+                self.state = 'ESTABLISHED'
+            elif flags & 0x01:  # FIN
+                self.state = 'FIN_WAIT'
+            elif flags & 0x04:  # RST
+                self.state = 'RESET'
 
 def generate_tone(frequency, duration, volume=0.5):
     sample_count = int(SAMPLE_RATE * duration)
@@ -46,16 +81,12 @@ def flow_monitor_thread():
         current_time = time.time()
         expired_flows = []
 
-        for flow_id, flow_info in flows.items():
-            if current_time - flow_info['last_seen'] > FLOW_TIMEOUT:
-                # Generate sound for the flow
-                frequency = 440.0
-                volume = 0.5
-
-                # Adjust frequency and volume based on flow attributes
-                frequency += (flow_info['packet_count'] % 100)
-                volume += (flow_info['packet_count'] % 10) / 100
-                volume = max(0.0, min(volume, 1.0))
+        for flow_id, flow in list(flows.items()):
+            if current_time - flow.last_seen > FLOW_TIMEOUT:
+                duration = flow.last_seen - flow.start_time
+                frequency = 440.0 + (flow.bytes_src_to_dst % 500)
+                volume = min(1.0, flow.bytes_src_to_dst / 1000 + flow.bytes_dst_to_src / 1000)
+                state = flow.state
 
                 sound = generate_tone(frequency, DURATION, volume)
                 try:
@@ -65,7 +96,6 @@ def flow_monitor_thread():
 
                 expired_flows.append(flow_id)
 
-        # Remove expired flows
         for flow_id in expired_flows:
             del flows[flow_id]
 
@@ -73,18 +103,28 @@ def packet_handler(packet):
     if IP in packet:
         src_ip = packet[IP].src
         dst_ip = packet[IP].dst
-        proto = packet.proto
-        flow_id = (src_ip, dst_ip, proto)
+        protocol = packet[IP].proto
 
-        current_time = time.time()
-        if flow_id in flows:
-            flows[flow_id]['packet_count'] += 1
-            flows[flow_id]['last_seen'] = current_time
+        if protocol == 6 and TCP in packet:
+            proto = 'TCP'
+            src_port = packet[TCP].sport
+            dst_port = packet[TCP].dport
+        elif protocol == 17 and UDP in packet:
+            proto = 'UDP'
+            src_port = packet[UDP].sport
+            dst_port = packet[UDP].dport
         else:
-            flows[flow_id] = {
-                'packet_count': 1,
-                'last_seen': current_time
-            }
+            proto = 'OTHER'
+            src_port = 0
+            dst_port = 0
+
+        flow_id = (src_ip, src_port, dst_ip, dst_port, proto)
+
+        if flow_id in flows:
+            flows[flow_id].update(packet)
+        else:
+            if proto in ['TCP', 'UDP']:
+                flows[flow_id] = Flow(src_ip, src_port, dst_ip, dst_port, proto)
 
 def main():
     parser = argparse.ArgumentParser(description="Network Flow Audio Sniffer")
@@ -103,13 +143,12 @@ def main():
         filters.append('not multicast and not broadcast')
     filter_str = ' and '.join(filters) if filters else None
 
-    # Start the audio playback thread
+    # Start threads
     playback_thread = threading.Thread(target=audio_playback_thread, daemon=True)
     playback_thread.start()
 
-    # Start the flow monitor thread
-    flow_thread = threading.Thread(target=flow_monitor_thread, daemon=True)
-    flow_thread.start()
+    monitor_thread = threading.Thread(target=flow_monitor_thread, daemon=True)
+    monitor_thread.start()
 
     try:
         sniff(filter=filter_str, prn=packet_handler, iface=args.interface)
