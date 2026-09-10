@@ -26,6 +26,8 @@ Run with the original short flow tones:
 python3 pcapsing.py
 ```
 
+Without `--ambient`, Pcapsing uses the legacy synchronous capture path and original flow-based volume/pitch behavior. The TUI, adaptive scenes, motifs, accents, automatic roots, and other new controls are only enabled when `--ambient` is present.
+
 Run with overlapping ambient pads generated from five-second traffic snapshots:
 
 ```bash

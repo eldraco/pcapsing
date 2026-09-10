@@ -15,7 +15,7 @@ import tty
 
 import numpy as np
 import pygame
-from scapy.all import AsyncSniffer, IP, TCP, UDP, ICMP
+from scapy.all import AsyncSniffer, sniff, IP, TCP, UDP, ICMP
 
 # Avoid root-owned cache files when packet capture is launched through sudo.
 sys.dont_write_bytecode = True
@@ -1275,20 +1275,11 @@ def generate_and_log_sound(flow):
     # Calculate volume with a minimum threshold to avoid volume 0
     calculated_volume = min(1.0, (flow.bytes_src_to_dst + flow.bytes_dst_to_src) / 2000)
     volume = max(calculated_volume, 0.05)  # Set a minimum volume of 0.05
-    settings = get_music_settings()
-    if settings['paused'] or settings['muted']:
-        log_flow(flow)
-        return
-
-    volume = min(
-        1.0,
-        volume * settings['volume_factor'] * settings['master_volume'],
-    )
+    # Preserve the original non-ambient volume and pitch behavior exactly.
     sound_data = generate_tone(
         flow.protocol,
         flow.state,
         volume=volume,
-        transpose=settings['transpose'],
     )
     if sound_data:
         sound, freq, vol = sound_data
@@ -1415,6 +1406,46 @@ def packet_handler(packet, ambient=False):
                         len(packet),
                     )
 
+def run_standard_mode(args, filter_str):
+    """Run the original flow-tone behavior without ambient subsystems."""
+    timestamp = time.strftime("[%m/%d/%y %H:%M:%S]")
+    filter_display = ansi_color(filter_str if filter_str else 'None', 'cyan')
+    interface_display = (
+        ansi_color(args.interface, 'magenta') if args.interface else 'None'
+    )
+    startup_message = (
+        f"{timestamp} Starting Network Flow Audio Sniffer...\n"
+        f"{timestamp} Filter applied: {filter_display}"
+    )
+    if args.interface:
+        startup_message += f"\n{timestamp} Sniffing on interface: {interface_display}"
+    logger.info(startup_message)
+
+    stop_event = threading.Event()
+    playback_thread = threading.Thread(
+        target=audio_playback_thread,
+        daemon=True,
+    )
+    monitor_thread = threading.Thread(
+        target=flow_monitor_thread,
+        args=(False, stop_event),
+        daemon=True,
+    )
+    playback_thread.start()
+    monitor_thread.start()
+
+    try:
+        sniff(filter=filter_str, prn=packet_handler, iface=args.interface)
+    except KeyboardInterrupt:
+        logger.info(ansi_color('[Stopping packet sniffing.]', 'yellow'))
+    finally:
+        stop_event.set()
+        monitor_thread.join()
+        audio_queue.put(None)
+        playback_thread.join()
+        pygame.mixer.quit()
+
+
 def main():
     global tui_active
 
@@ -1467,6 +1498,20 @@ def main():
     if not 0.0 <= args.volume <= 2.0:
         parser.error('--volume must be between 0.0 and 2.0')
 
+    ambient_options_requested = (
+        args.tui
+        or args.fullscreen
+        or args.background != 'auto'
+        or args.variation != 'medium'
+        or args.root != 'auto'
+        or args.volume != DEFAULT_MASTER_VOLUME
+    )
+    if not args.ambient and ambient_options_requested:
+        parser.error(
+            '--tui, --fullscreen, --background, --variation, --root, and '
+            '--volume require --ambient'
+        )
+
     with music_state_lock:
         music_state['master_volume'] = args.volume
         music_state['variation_index'] = VARIATION_LEVELS.index(args.variation)
@@ -1501,6 +1546,10 @@ def main():
     if not args.include_multicast:
         filters.append('not multicast and not broadcast')
     filter_str = ' and '.join(filters) if filters else None
+
+    if not args.ambient:
+        run_standard_mode(args, filter_str)
+        return
 
     # Display startup information with colors
     timestamp = time.strftime("[%m/%d/%y %H:%M:%S]")
