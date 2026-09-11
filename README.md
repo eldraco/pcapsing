@@ -74,10 +74,18 @@ python3 pcapsing.py --ambient --tcp --interface eth0
 
 Use `python3 pcapsing.py --help` to see all options.
 
-Raw packet capture normally requires elevated privileges on Linux. Use the virtual environment's absolute Python path so `sudo` does not select the system Python:
+Raw packet capture requires `CAP_NET_RAW` on Linux. Do not run the complete audio/TUI process with `sudo -E`: root inherits the user's audio runtime and produces `XDG_RUNTIME_DIR` ownership warnings. Instead, create a dedicated interpreter copy and grant capabilities only to that copy:
 
 ```bash
-sudo -E "$(pwd)/.venv/bin/python" pcapsing.py --ambient --tui --interface wlp2s0
+cp --dereference .venv/bin/python .venv/bin/python-pcapsing
+sudo setcap cap_net_raw,cap_net_admin=eip .venv/bin/python-pcapsing
+getcap .venv/bin/python-pcapsing
+```
+
+Do not apply `setcap` to `.venv/bin/python` itself because it is normally a symlink to the system Python. Run Pcapsing as your regular user:
+
+```bash
+.venv/bin/python-pcapsing pcapsing.py --ambient --tui --interface wlp2s0
 ```
 
 List available interfaces with `ip -brief link`.
@@ -87,7 +95,7 @@ List available interfaces with `ip -brief link`.
 `traffic_generator.py` creates bounded traffic entirely inside `127.0.0.0/8`; it does not send packets to external hosts. Run Pcapsing on loopback in one terminal:
 
 ```bash
-sudo -E "$(pwd)/.venv/bin/python" pcapsing.py \
+.venv/bin/python-pcapsing pcapsing.py \
   --ambient --tui --background auto --variation high --interface lo
 ```
 
