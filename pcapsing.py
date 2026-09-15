@@ -5,7 +5,7 @@ import os
 import sys
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 
 import numpy as np
 import pygame
@@ -39,6 +39,18 @@ TEMPO_BASELINE_STEP_BPM = 4.0
 TEMPO_BASELINE_DEFAULT_OFFSET = -16.0
 TEMPO_BASELINE_MIN_OFFSET = -72.0
 TEMPO_BASELINE_MAX_OFFSET = 28.0
+
+# Security detection windows/thresholds
+SECURITY_WINDOW_SECONDS = 60.0
+PORT_SCAN_WINDOW_SECONDS = 12.0
+PORT_SCAN_UNIQUE_PORTS_THRESHOLD = 16
+NEW_DST_IP_WINDOW_SECONDS = 25.0
+NEW_DST_IP_THRESHOLD = 14
+LARGE_TRANSFER_WINDOW_SECONDS = 20.0
+LARGE_TRANSFER_BYTES_THRESHOLD = 12_000_000
+NEW_DST_PORT_WINDOW_SECONDS = 45.0
+NEW_DST_PORT_THRESHOLD = 6
+SECURITY_COMPUTE_INTERVAL_SECONDS = 0.8
 
 # Musical settings (deeper/groove-focused)
 CHORD_PROGRESSION = [0, 3, 5, 7]  # i, III, iv, v (relative to C)
@@ -251,29 +263,165 @@ class TrafficStats:
         self.window_seconds = window_seconds
         self.instant_window = instant_window
         self.lock = threading.Lock()
-        self.events = deque()  # (timestamp, protocol, packet_length)
+        self.events = deque()  # (timestamp, protocol, packet_length, src_ip, dst_ip, dst_port)
         self.window_packets = 0
         self.window_bytes = 0
         self.protocol_counts = {"TCP": 0, "UDP": 0, "ICMP": 0}
+        self.security_events = deque()  # (timestamp, src_ip, dst_ip, dst_port, packet_length)
+        self.seen_dst_ips = set()
+        self.seen_dst_ports = set()
+        self.new_dst_ip_events = deque()  # timestamps for first-seen destination IPs
+        self.new_dst_port_events = deque()  # timestamps for first-seen destination ports
+        self.last_security_compute_ts = 0.0
+        self.cached_security_snapshot = {
+            "pressure": 0.0,
+            "labels": [],
+            "port_scan": {"active": False, "max_unique_ports": 0, "source": "-"},
+            "new_destination_ips": {"active": False, "count": 0},
+            "large_transfer": {"active": False, "max_bytes": 0},
+            "new_destination_ports": {"active": False, "count": 0},
+        }
 
     def _prune_locked(self, now_ts):
         cutoff = now_ts - self.window_seconds
         while self.events and self.events[0][0] < cutoff:
-            _, protocol, pkt_len = self.events.popleft()
+            _, protocol, pkt_len, _, _, _ = self.events.popleft()
             self.window_packets = max(0, self.window_packets - 1)
             self.window_bytes = max(0, self.window_bytes - pkt_len)
             if protocol in self.protocol_counts:
                 self.protocol_counts[protocol] = max(0, self.protocol_counts[protocol] - 1)
 
-    def record_packet(self, protocol, pkt_len):
+        security_cutoff = now_ts - SECURITY_WINDOW_SECONDS
+        while self.security_events and self.security_events[0][0] < security_cutoff:
+            self.security_events.popleft()
+
+        new_ip_cutoff = now_ts - NEW_DST_IP_WINDOW_SECONDS
+        while self.new_dst_ip_events and self.new_dst_ip_events[0] < new_ip_cutoff:
+            self.new_dst_ip_events.popleft()
+
+        new_port_cutoff = now_ts - NEW_DST_PORT_WINDOW_SECONDS
+        while self.new_dst_port_events and self.new_dst_port_events[0] < new_port_cutoff:
+            self.new_dst_port_events.popleft()
+
+    def record_packet(self, protocol, pkt_len, src_ip, dst_ip, dst_port):
         now_ts = time.time()
         with self.lock:
-            self.events.append((now_ts, protocol, pkt_len))
+            self.events.append((now_ts, protocol, pkt_len, src_ip, dst_ip, dst_port))
             self.window_packets += 1
             self.window_bytes += pkt_len
             if protocol in self.protocol_counts:
                 self.protocol_counts[protocol] += 1
+
+            self.security_events.append((now_ts, src_ip, dst_ip, dst_port, pkt_len))
+            if dst_ip not in self.seen_dst_ips:
+                self.seen_dst_ips.add(dst_ip)
+                self.new_dst_ip_events.append(now_ts)
+
+            if dst_port > 0 and dst_port not in self.seen_dst_ports:
+                self.seen_dst_ports.add(dst_port)
+                self.new_dst_port_events.append(now_ts)
+
             self._prune_locked(now_ts)
+
+    def _compute_security_snapshot_locked(self, now_ts):
+        if now_ts - self.last_security_compute_ts < SECURITY_COMPUTE_INTERVAL_SECONDS:
+            return self.cached_security_snapshot
+
+        scan_cutoff = now_ts - PORT_SCAN_WINDOW_SECONDS
+        transfer_cutoff = now_ts - LARGE_TRANSFER_WINDOW_SECONDS
+
+        src_to_ports = defaultdict(set)
+        bytes_by_destination = defaultdict(int)
+
+        for event_ts, src_ip, dst_ip, dst_port, pkt_len in self.security_events:
+            if event_ts >= scan_cutoff and dst_port > 0:
+                src_to_ports[src_ip].add(dst_port)
+            if event_ts >= transfer_cutoff:
+                bytes_by_destination[dst_ip] += pkt_len
+
+        max_unique_ports = 0
+        scan_source = "-"
+        for src_ip, unique_ports in src_to_ports.items():
+            if len(unique_ports) > max_unique_ports:
+                max_unique_ports = len(unique_ports)
+                scan_source = src_ip
+
+        port_scan_active = max_unique_ports >= PORT_SCAN_UNIQUE_PORTS_THRESHOLD
+        port_scan_score = 0.0
+        if max_unique_ports > PORT_SCAN_UNIQUE_PORTS_THRESHOLD:
+            over = max_unique_ports - PORT_SCAN_UNIQUE_PORTS_THRESHOLD
+            port_scan_score = min(2.0, over / max(1.0, PORT_SCAN_UNIQUE_PORTS_THRESHOLD * 0.7))
+        if port_scan_active:
+            port_scan_score = max(port_scan_score, 0.65)
+
+        new_dst_ip_count = len(self.new_dst_ip_events)
+        new_dst_ips_active = new_dst_ip_count >= NEW_DST_IP_THRESHOLD
+        new_dst_ips_score = 0.0
+        if new_dst_ip_count > NEW_DST_IP_THRESHOLD:
+            new_dst_ips_score = min(2.0, (new_dst_ip_count - NEW_DST_IP_THRESHOLD) / max(1.0, NEW_DST_IP_THRESHOLD * 0.8))
+        if new_dst_ips_active:
+            new_dst_ips_score = max(new_dst_ips_score, 0.50)
+
+        max_transfer_bytes = max(bytes_by_destination.values(), default=0)
+        large_transfer_active = max_transfer_bytes >= LARGE_TRANSFER_BYTES_THRESHOLD
+        large_transfer_score = 0.0
+        if max_transfer_bytes > LARGE_TRANSFER_BYTES_THRESHOLD:
+            large_transfer_score = min(
+                2.0,
+                (max_transfer_bytes - LARGE_TRANSFER_BYTES_THRESHOLD) / max(1.0, LARGE_TRANSFER_BYTES_THRESHOLD * 0.8),
+            )
+        if large_transfer_active:
+            large_transfer_score = max(large_transfer_score, 0.55)
+
+        new_dst_port_count = len(self.new_dst_port_events)
+        new_dst_ports_active = new_dst_port_count >= NEW_DST_PORT_THRESHOLD
+        new_dst_ports_score = 0.0
+        if new_dst_port_count > NEW_DST_PORT_THRESHOLD:
+            new_dst_ports_score = min(2.0, (new_dst_port_count - NEW_DST_PORT_THRESHOLD) / max(1.0, NEW_DST_PORT_THRESHOLD * 0.8))
+        if new_dst_ports_active:
+            new_dst_ports_score = max(new_dst_ports_score, 0.45)
+
+        labels = []
+        if port_scan_active:
+            labels.append("port-scan")
+        if new_dst_ips_active:
+            labels.append("many-new-dst-ips")
+        if large_transfer_active:
+            labels.append("large-transfer")
+        if new_dst_ports_active:
+            labels.append("new-dst-ports")
+
+        pressure = (
+            0.40 * port_scan_score
+            + 0.24 * new_dst_ips_score
+            + 0.22 * large_transfer_score
+            + 0.14 * new_dst_ports_score
+        )
+        pressure = max(0.0, min(2.0, pressure))
+
+        self.cached_security_snapshot = {
+            "pressure": pressure,
+            "labels": labels,
+            "port_scan": {
+                "active": port_scan_active,
+                "max_unique_ports": max_unique_ports,
+                "source": scan_source,
+            },
+            "new_destination_ips": {
+                "active": new_dst_ips_active,
+                "count": new_dst_ip_count,
+            },
+            "large_transfer": {
+                "active": large_transfer_active,
+                "max_bytes": max_transfer_bytes,
+            },
+            "new_destination_ports": {
+                "active": new_dst_ports_active,
+                "count": new_dst_port_count,
+            },
+        }
+        self.last_security_compute_ts = now_ts
+        return self.cached_security_snapshot
 
     def snapshot(self, active_flows):
         now_ts = time.time()
@@ -287,13 +435,14 @@ class TrafficStats:
 
             instant_cutoff = now_ts - self.instant_window
             instant_packets = 0
-            for event_ts, _, _ in reversed(self.events):
+            for event_ts, _, _, _, _, _ in reversed(self.events):
                 if event_ts < instant_cutoff:
                     break
                 instant_packets += 1
             instant_pps = instant_packets / self.instant_window
 
             proto_counts = {k: max(0, v) for k, v in self.protocol_counts.items()}
+            security = self._compute_security_snapshot_locked(now_ts)
 
         total_proto_packets = sum(proto_counts.values())
         if total_proto_packets > 0:
@@ -315,6 +464,9 @@ class TrafficStats:
             "dominant_protocol": dominant_protocol,
             "protocol_mix": protocol_mix,
             "active_flows": active_flows,
+            "security": security,
+            "security_pressure": security["pressure"],
+            "security_labels": security["labels"],
         }
 
 
@@ -333,6 +485,143 @@ class MelodyEngine:
         self.degree_cursor = 0
         self.last_lead_midi = 57
         self.next_status_log_ts = 0.0
+        self.last_logged_music_state = None
+        self.smoothed_pps = 0.0
+        self.smoothed_bps = 0.0
+        self.smoothed_burstiness = 0.0
+        self.smoothed_security_pressure = 0.0
+
+    def _protocol_color_description(self, protocol):
+        if protocol == "TCP":
+            return "more grounded/steady"
+        if protocol == "UDP":
+            return "lighter and more agile"
+        if protocol == "ICMP":
+            return "darker and tenser"
+        return "balanced"
+
+    def _smooth_control(self, current, target, alpha_rise, alpha_fall):
+        alpha = alpha_rise if target > current else alpha_fall
+        return current + alpha * (target - current)
+
+    def _update_smoothed_controls(self, snapshot):
+        # Strong smoothing to avoid large musical jumps on small traffic fluctuations.
+        self.smoothed_pps = self._smooth_control(self.smoothed_pps, snapshot["pps"], alpha_rise=0.08, alpha_fall=0.035)
+        self.smoothed_bps = self._smooth_control(self.smoothed_bps, snapshot["bps"], alpha_rise=0.08, alpha_fall=0.04)
+        self.smoothed_burstiness = self._smooth_control(
+            self.smoothed_burstiness,
+            snapshot["burstiness"],
+            alpha_rise=0.10,
+            alpha_fall=0.05,
+        )
+        self.smoothed_security_pressure = self._smooth_control(
+            self.smoothed_security_pressure,
+            snapshot["security_pressure"],
+            alpha_rise=0.16,
+            alpha_fall=0.05,
+        )
+
+    def _build_music_change_explanation(self, snapshot):
+        security = snapshot.get("security", {})
+        security_flags = (
+            security.get("port_scan", {}).get("active", False),
+            security.get("new_destination_ips", {}).get("active", False),
+            security.get("large_transfer", {}).get("active", False),
+            security.get("new_destination_ports", {}).get("active", False),
+        )
+        current_state = {
+            "pps": snapshot["pps"],
+            "burstiness": snapshot["burstiness"],
+            "dominant_protocol": snapshot["dominant_protocol"],
+            "bpm": self.current_bpm,
+            "swing": self.current_swing,
+            "intensity": self.smoothed_intensity,
+            "security_pressure": snapshot.get("security_pressure", 0.0),
+            "security_flags": security_flags,
+        }
+
+        previous = self.last_logged_music_state
+        self.last_logged_music_state = current_state
+
+        if previous is None:
+            return "traffic baseline captured; groove initialized and waiting for network movement."
+
+        parts = []
+        pps_delta = current_state["pps"] - previous["pps"]
+        bpm_delta = current_state["bpm"] - previous["bpm"]
+        burst_delta = current_state["burstiness"] - previous["burstiness"]
+        intensity_delta = current_state["intensity"] - previous["intensity"]
+        security_delta = current_state["security_pressure"] - previous["security_pressure"]
+
+        if pps_delta > 3.0:
+            parts.append(
+                f"packet rate rose ({previous['pps']:.1f}->{current_state['pps']:.1f} pps), so tempo pushed faster ({bpm_delta:+.1f} bpm)."
+            )
+        elif pps_delta < -3.0:
+            parts.append(
+                f"packet rate dropped ({previous['pps']:.1f}->{current_state['pps']:.1f} pps), so tempo relaxed ({bpm_delta:+.1f} bpm)."
+            )
+        elif abs(bpm_delta) > 1.8:
+            parts.append(f"tempo drifted ({bpm_delta:+.1f} bpm) with traffic trend smoothing.")
+
+        if burst_delta > 0.15:
+            parts.append("traffic got burstier, so rhythm became more syncopated.")
+        elif burst_delta < -0.15:
+            parts.append("traffic smoothed out, so rhythm became more even.")
+
+        if intensity_delta > 0.09:
+            parts.append("activity increased, so drums/bass density thickened.")
+        elif intensity_delta < -0.09:
+            parts.append("activity decreased, so arrangement thinned out.")
+
+        if current_state["dominant_protocol"] != previous["dominant_protocol"]:
+            old_proto = previous["dominant_protocol"]
+            new_proto = current_state["dominant_protocol"]
+            parts.append(
+                f"protocol focus shifted {old_proto}->{new_proto}, making tone {self._protocol_color_description(new_proto)}."
+            )
+
+        swing_delta = current_state["swing"] - previous["swing"]
+        if swing_delta > 0.03:
+            parts.append("groove swing increased slightly.")
+        elif swing_delta < -0.03:
+            parts.append("groove swing tightened slightly.")
+
+        if security_delta > 0.15:
+            parts.append("security pressure increased, adding controlled tension to rhythm and articulation.")
+        elif security_delta < -0.15:
+            parts.append("security pressure eased, so the groove relaxed while staying monitored.")
+
+        prev_flags = previous["security_flags"]
+        curr_flags = current_state["security_flags"]
+
+        if curr_flags[0] and not prev_flags[0]:
+            parts.append("port-scan signature detected; hats tighten and rhythm becomes more alert.")
+        elif prev_flags[0] and not curr_flags[0]:
+            parts.append("port-scan signature faded; percussive tension softened.")
+
+        if curr_flags[1] and not prev_flags[1]:
+            parts.append("many new destination IPs detected; melodic movement broadens.")
+        elif prev_flags[1] and not curr_flags[1]:
+            parts.append("new destination IP discovery slowed; melody narrows back.")
+
+        if curr_flags[2] and not prev_flags[2]:
+            parts.append("large transfer detected; low-end becomes heavier and more sustained.")
+        elif prev_flags[2] and not curr_flags[2]:
+            parts.append("large transfer pressure dropped; bass weight eases.")
+
+        if curr_flags[3] and not prev_flags[3]:
+            parts.append("completely new destination ports appeared; subtle top accents were added.")
+        elif prev_flags[3] and not curr_flags[3]:
+            parts.append("new destination-port activity normalized; top accents receded.")
+
+        if not parts:
+            active_names = snapshot.get("security_labels", [])
+            if active_names:
+                return f"traffic stable; security patterns persist ({', '.join(active_names)}) with smoothed musical tension."
+            return "traffic stayed stable; musical feel remains steady."
+
+        return " ".join(parts)
 
     def adjust_tempo_baseline(self, delta_bpm):
         """Adjust baseline tempo offset while preserving traffic-driven behavior."""
@@ -353,23 +642,28 @@ class MelodyEngine:
             return self.tempo_baseline_offset
 
     def _target_intensity(self, snapshot):
-        pps_component = min(1.0, math.log1p(snapshot["pps"]) / math.log1p(180.0))
+        pps_component = min(1.0, math.log1p(self.smoothed_pps) / math.log1p(180.0))
         flow_component = min(1.0, snapshot["active_flows"] / 32.0)
-        bps_component = min(1.0, math.log1p(snapshot["bps"]) / math.log1p(220000.0))
-        return max(0.05, 0.55 * pps_component + 0.25 * flow_component + 0.20 * bps_component)
+        bps_component = min(1.0, math.log1p(self.smoothed_bps) / math.log1p(220000.0))
+        security_component = min(1.0, self.smoothed_security_pressure / 1.4)
+        return max(0.05, 0.48 * pps_component + 0.22 * flow_component + 0.18 * bps_component + 0.12 * security_component)
 
     def _update_tempo(self, snapshot):
         baseline_offset = self.get_tempo_baseline_offset()
 
-        target_bpm = 74.0 + baseline_offset + min(42.0, math.sqrt(snapshot["pps"] + 1.0) * 6.2)
-        target_bpm += min(9.0, snapshot["burstiness"] * 4.5)
-        self.current_bpm += 0.09 * (target_bpm - self.current_bpm)
+        target_bpm = 72.0 + baseline_offset + min(34.0, math.sqrt(self.smoothed_pps + 1.0) * 5.4)
+        target_bpm += min(6.0, self.smoothed_burstiness * 3.6)
+        target_bpm += min(5.0, self.smoothed_security_pressure * 2.8)
+        self.current_bpm += 0.055 * (target_bpm - self.current_bpm)
         min_bpm = max(38.0, 70.0 + baseline_offset)
         max_bpm = max(min_bpm + 12.0, 126.0 + baseline_offset)
         self.current_bpm = max(min_bpm, min(max_bpm, self.current_bpm))
 
-        target_swing = 0.54 + min(0.10, max(0.0, snapshot["burstiness"] - 0.8) * 0.05 + self.smoothed_intensity * 0.03)
-        self.current_swing += 0.16 * (target_swing - self.current_swing)
+        target_swing = 0.54 + min(
+            0.08,
+            max(0.0, self.smoothed_burstiness - 0.9) * 0.04 + self.smoothed_intensity * 0.02 + self.smoothed_security_pressure * 0.015,
+        )
+        self.current_swing += 0.11 * (target_swing - self.current_swing)
         self.current_swing = max(0.52, min(0.64, self.current_swing))
 
         # 16th-note base with swing applied across step pairs.
@@ -393,7 +687,13 @@ class MelodyEngine:
         chord = CHORD_PROGRESSION[(self.step_index // 16) % len(CHORD_PROGRESSION)]
         step = self.step_index % 16
         intensity = self.smoothed_intensity
-        burst = snapshot["burstiness"]
+        burst = self.smoothed_burstiness
+        security = snapshot.get("security", {})
+        security_pressure = self.smoothed_security_pressure
+        scan_active = security.get("port_scan", {}).get("active", False)
+        new_ips_active = security.get("new_destination_ips", {}).get("active", False)
+        large_transfer_active = security.get("large_transfer", {}).get("active", False)
+        new_ports_active = security.get("new_destination_ports", {}).get("active", False)
 
         protocol_mix = snapshot["protocol_mix"]
         blended_timbre = (
@@ -413,18 +713,29 @@ class MelodyEngine:
         )
 
         # Groove percussion.
-        kick_hit = step in {0, 8} or (intensity > 0.22 and step in {6, 14}) or (burst > 1.15 and step in {3, 11})
-        snare_hit = step in {4, 12} or (intensity > 0.62 and step == 15)
+        kick_hit = step in {0, 8} or (intensity > 0.28 and step in {6, 14}) or (burst > 1.20 and step in {3, 11})
+        if large_transfer_active and step in {2, 10}:
+            kick_hit = True
+
+        snare_hit = step in {4, 12} or ((intensity > 0.65 or scan_active) and step == 15)
         hat_hit = (step % 2 == 1) or (intensity > 0.45 and step in {2, 6, 10, 14})
+        if scan_active and step in {1, 5, 9, 13}:
+            hat_hit = True
 
         if kick_hit:
-            kick = synthesize_kick(duration=max(0.11, step_seconds * 1.45), volume=0.18 + 0.28 * intensity)
+            kick = synthesize_kick(
+                duration=max(0.11, step_seconds * 1.45),
+                volume=min(0.58, 0.16 + 0.23 * intensity + 0.06 * security_pressure),
+            )
             self._play_sound(kick)
         if snare_hit:
-            snare = synthesize_snare(duration=max(0.08, step_seconds * 1.15), volume=0.08 + 0.20 * intensity)
+            snare = synthesize_snare(
+                duration=max(0.08, step_seconds * 1.15),
+                volume=min(0.44, 0.07 + 0.18 * intensity + 0.04 * security_pressure),
+            )
             self._play_sound(snare)
         if hat_hit:
-            hat_volume = 0.03 + 0.08 * intensity + (0.02 if step in {3, 7, 11, 15} else 0.0)
+            hat_volume = 0.025 + 0.07 * intensity + (0.018 if step in {3, 7, 11, 15} else 0.0) + 0.02 * security_pressure
             hat = synthesize_hihat(duration=max(0.04, step_seconds * 0.65), volume=hat_volume)
             self._play_sound(hat)
 
@@ -432,41 +743,57 @@ class MelodyEngine:
         if step in {0, 8}:
             pad_root = 43 + chord
             pad_duration = step_seconds * (8.4 if step == 0 else 6.8)
-            pad_volume = 0.03 + 0.05 * intensity
+            pad_volume = 0.03 + 0.045 * intensity + (0.01 if new_ips_active else 0.0)
             for note in (pad_root, pad_root + 7, pad_root + 10):
                 pad_sound = synthesize_tone(
                     midi_to_frequency(note),
                     duration=pad_duration,
                     volume=pad_volume,
-                    timbre=0.08 + 0.16 * blended_timbre,
+                    timbre=0.08 + 0.18 * blended_timbre + 0.08 * security_pressure,
                 )
                 self._play_sound(pad_sound)
 
+            if new_ports_active:
+                accent_midi = int(max(72, min(88, 79 + color_shift)))
+                accent_sound = synthesize_tone(
+                    midi_to_frequency(accent_midi),
+                    duration=max(0.05, step_seconds * 0.56),
+                    volume=0.03 + 0.03 * security_pressure,
+                    timbre=0.84,
+                )
+                self._play_sound(accent_sound)
+
         # Bass groove line.
         bass_pattern = {0: 0, 3: 2, 6: 4, 8: 0, 10: 2, 11: 3, 14: 4}
+        if large_transfer_active:
+            bass_pattern[12] = 0
         if step in bass_pattern:
             bass_degree = bass_pattern[step] % len(scale)
             bass_midi = 31 + chord + scale[bass_degree] + int(round(color_shift * 0.5))
             bass_midi = int(max(28, min(50, bass_midi)))
             bass_duration = step_seconds * (2.4 if step in {0, 8} else 1.7)
-            bass_volume = 0.06 + 0.15 * intensity
+            if large_transfer_active:
+                bass_duration *= 1.32
+            bass_volume = 0.06 + 0.14 * intensity + (0.05 if large_transfer_active else 0.0)
             bass_sound = synthesize_tone(
                 midi_to_frequency(bass_midi),
                 duration=bass_duration,
                 volume=bass_volume,
-                timbre=0.05,
+                timbre=0.05 + 0.05 * security_pressure,
             )
             self._play_sound(bass_sound)
 
         # Syncopated lead melody.
         lead_steps = {1, 7, 9, 13}
-        if intensity > 0.30:
+        if intensity > 0.34:
             lead_steps.update({3, 10, 15})
-        if intensity > 0.60 or burst > 1.20:
+        if intensity > 0.64 or burst > 1.24:
             lead_steps.update({5, 11})
+        if new_ips_active:
+            lead_steps.update({2, 6, 14})
 
         if step in lead_steps:
-            motion = int(snapshot["instant_pps"] * 0.22 + snapshot["active_flows"] * 0.14 + burst * 1.8)
+            motion = int(self.smoothed_pps * 0.10 + snapshot["active_flows"] * 0.10 + burst * 1.5 + security_pressure * 1.4)
             self.degree_cursor = (self.degree_cursor + motion + 1) % len(scale)
 
             target_midi = 55 + chord + scale[self.degree_cursor] + color_shift
@@ -481,8 +808,8 @@ class MelodyEngine:
             self.last_lead_midi = target_midi
 
             lead_duration = max(0.05, step_seconds * (0.82 if step % 2 == 0 else 0.72))
-            lead_volume = 0.05 + 0.17 * intensity
-            lead_timbre = min(0.72, 0.28 + blended_timbre * 0.5)
+            lead_volume = 0.045 + 0.15 * intensity + 0.03 * security_pressure
+            lead_timbre = min(0.78, 0.26 + blended_timbre * 0.48 + 0.10 * security_pressure)
             lead_sound = synthesize_tone(
                 midi_to_frequency(target_midi),
                 duration=lead_duration,
@@ -500,6 +827,15 @@ class MelodyEngine:
                 )
                 self._play_sound(harmony_sound)
 
+            if new_ports_active and step in {10, 15}:
+                sparkle_sound = synthesize_tone(
+                    midi_to_frequency(min(92, target_midi + 12)),
+                    duration=max(0.04, lead_duration * 0.5),
+                    volume=lead_volume * 0.28,
+                    timbre=0.92,
+                )
+                self._play_sound(sparkle_sound)
+
     def _maybe_log_status(self, snapshot):
         now_ts = time.time()
         if now_ts < self.next_status_log_ts:
@@ -509,12 +845,22 @@ class MelodyEngine:
         timestamp = time.strftime("[%m/%d/%y %H:%M:%S]")
         protocol = snapshot["dominant_protocol"]
         protocol_color = {"TCP": "blue", "UDP": "green", "ICMP": "magenta"}.get(protocol, "reset")
+        security = snapshot.get("security", {})
+        security_labels = security.get("labels", [])
+        security_display = ",".join(security_labels) if security_labels else "none"
+        scan_ports = security.get("port_scan", {}).get("max_unique_ports", 0)
+        new_ips = security.get("new_destination_ips", {}).get("count", 0)
+        new_ports = security.get("new_destination_ports", {}).get("count", 0)
+        max_transfer_mb = security.get("large_transfer", {}).get("max_bytes", 0) / 1_000_000.0
         message = (
             f"{timestamp} Melody | BPM:{self.current_bpm:5.1f} "
-            f"PPS:{snapshot['pps']:6.1f} ActiveFlows:{snapshot['active_flows']:4d} "
+            f"PPS:{snapshot['pps']:6.1f} SmPPS:{self.smoothed_pps:6.1f} ActiveFlows:{snapshot['active_flows']:4d} "
             f"Dominant:{ansi_color(protocol, protocol_color)} "
             f"Burst:{snapshot['burstiness']:.2f} Swing:{self.current_swing:.2f} "
-            f"BaseShift:{self.get_tempo_baseline_offset():+4.0f}"
+            f"BaseShift:{self.get_tempo_baseline_offset():+4.0f} "
+            f"Sec:{security_display} SecP:{snapshot.get('security_pressure', 0.0):.2f} "
+            f"ScanPorts:{scan_ports:2d} NewIPs:{new_ips:2d} NewPorts:{new_ports:2d} XferMax:{max_transfer_mb:4.1f}MB | "
+            f"MusicChange: {self._build_music_change_explanation(snapshot)}"
         )
         logger.info(message)
 
@@ -526,8 +872,14 @@ class MelodyEngine:
                 active_flows = len(flows)
 
             snapshot = self.traffic_stats.snapshot(active_flows)
+            self._update_smoothed_controls(snapshot)
             target_intensity = self._target_intensity(snapshot)
-            self.smoothed_intensity += 0.18 * (target_intensity - self.smoothed_intensity)
+            self.smoothed_intensity = self._smooth_control(
+                self.smoothed_intensity,
+                target_intensity,
+                alpha_rise=0.12,
+                alpha_fall=0.06,
+            )
             step_seconds = self._update_tempo(snapshot)
             self._compose_step(snapshot, step_seconds)
 
@@ -680,7 +1032,7 @@ def packet_handler(packet):
     else:
         return
 
-    traffic_stats.record_packet(proto, pkt_len)
+    traffic_stats.record_packet(proto, pkt_len, src_ip, dst_ip, dst_port)
 
     if proto == "ICMP":
         flow_id = (src_ip, 0, dst_ip, 0, proto)
