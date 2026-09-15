@@ -3,10 +3,11 @@
 A network sniffer that turns live traffic into continuous groove music so you can monitor activity by listening.
 
 Instead of alarm-like beeps, it now runs a continuous melody engine:
-- tempo follows packet rate and burstiness,
+- tempo follows smoothed packet-rate trends (not packet jitter),
 - note and harmonic color follow protocol mix (TCP/UDP/ICMP),
 - texture and rhythmic density change with traffic intensity,
-- low bass + pad background keep the sound deeper and smoother.
+- low bass + pad background keep the sound deeper and smoother,
+- security patterns are tracked and blended into the groove.
 
 # Usage
 `python pcapsing.py`
@@ -32,3 +33,9 @@ Runtime tempo hotkeys (while running in terminal):
 
 These keys shift only the base tempo. Traffic still controls relative rhythm changes.
 The app now starts with a slower default baseline (`-16 BPM`) and allows much slower values than before.
+
+Security patterns detected (shown in status lines and reflected musically):
+- port scans
+- too many new destination IPs
+- too large transfers
+- completely new destination ports
